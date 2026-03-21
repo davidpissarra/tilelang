@@ -639,7 +639,8 @@ private:
     if (num_stages_anno.defined()) {
       ICHECK(num_stages_anno.as<IntImmNode>());
       num_stages = static_cast<int>(num_stages_anno.as<IntImmNode>()->value);
-      ICHECK(num_stages_ == 1) << "Nested pipeline not supported.";
+      ICHECK(pipeline_info_.op_infos.size() == 0)
+          << "Nested pipeline with explicit group annotations not supported.";
     }
     loop_stack_.emplace_back(op->loop_var, op->extent);
 

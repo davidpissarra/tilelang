@@ -123,6 +123,8 @@ public:
   void VisitStmt_(const LetStmtNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const AttrStmtNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const AssertStmtNode *op) final { HandleBodyStmt(op); }
+  void VisitStmt_(const AllocateNode *op) final { HandleBodyStmt(op); }
+  void VisitStmt_(const AllocateConstNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const BlockNode *op) final { HandleBodyStmt(op); }
 
   bool HasProducer() { return has_simt_copy_ || has_bulk_copy_; }

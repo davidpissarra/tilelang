@@ -86,6 +86,73 @@ template <typename T> static Array<T> ReverseArray(Array<T> array) {
   return Array<T>{array.rbegin(), array.rend()};
 }
 
+static Array<PrimExpr> MakeDefaultStrides(const Array<PrimExpr> &shape) {
+  Array<PrimExpr> strides;
+  PrimExpr stride = 1;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    auto idx = shape.size() - i - 1;
+    strides.insert(strides.begin(), stride);
+    stride *= shape[idx];
+  }
+  return strides;
+}
+
+static bool NormalizeGlobalTensorView(const Buffer &buffer,
+                                      const Array<Range> &buffer_range,
+                                      arith::Analyzer *analyzer,
+                                      Array<PrimExpr> *logical_shape,
+                                      Array<PrimExpr> *global_coords) {
+  ICHECK(logical_shape != nullptr);
+  ICHECK(global_coords != nullptr);
+  ICHECK_EQ(buffer->shape.size(), buffer_range.size())
+      << "buffer shape/range rank mismatch";
+
+  *logical_shape = buffer->shape;
+  global_coords->clear();
+  for (const auto &range : buffer_range) {
+    global_coords->push_back(range->min);
+  }
+
+  if (!buffer->elem_offset.defined() || is_zero(buffer->elem_offset)) {
+    return true;
+  }
+
+  Array<PrimExpr> strides =
+      buffer->strides.empty() ? MakeDefaultStrides(buffer->shape) : buffer->strides;
+  ICHECK_EQ(strides.size(), buffer->shape.size())
+      << "buffer stride/shape rank mismatch";
+
+  PrimExpr remaining_offset = analyzer->Simplify(buffer->elem_offset);
+  for (size_t i = 0; i < strides.size(); ++i) {
+    PrimExpr coord;
+    if (i + 1 < strides.size()) {
+      coord = analyzer->Simplify(FloorDiv(remaining_offset, strides[i]));
+      remaining_offset = analyzer->Simplify(FloorMod(remaining_offset, strides[i]));
+    } else {
+      coord = analyzer->Simplify(remaining_offset);
+    }
+
+    PrimExpr normalized_coord =
+        analyzer->Simplify((*global_coords)[i] + coord);
+    global_coords->Set(i, normalized_coord);
+
+    PrimExpr last_accessed =
+        analyzer->Simplify(normalized_coord + buffer_range[i]->extent - 1);
+    arith::ConstIntBound bound = analyzer->const_int_bound(last_accessed);
+    if (bound->min_value < 0 || bound->max_value == arith::ConstIntBound::kPosInf) {
+      return false;
+    }
+
+    int64_t required_extent = bound->max_value + 1;
+    if (const auto *current_extent = as_const_int((*logical_shape)[i])) {
+      required_extent = std::max(required_extent, *current_extent);
+    }
+    (*logical_shape).Set(i, IntImm((*logical_shape)[i].dtype(), required_extent));
+  }
+
+  return true;
+}
+
 Stmt Copy::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer) const {
   if (T.disable_tma_lower)
     return Stmt();
@@ -149,10 +216,18 @@ Stmt Copy::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer) const {
   desc.data_type = to_CUtensorMapDataType(global_tensor->dtype);
 
   // Global Tensor Shape and Stride
+  Array<PrimExpr> logical_global_shape;
+  Array<PrimExpr> global_coords;
+  if (!NormalizeGlobalTensorView(global_tensor, global_range, analyzer,
+                                 &logical_global_shape, &global_coords)) {
+    LOG(WARNING)
+        << "TMA bulk copy cannot normalize sliced buffer view for "
+        << global_tensor->name << ", fallback to normal copy.";
+    return Stmt();
+  }
   desc.global_addr = global_tensor->data;
-  desc.global_shape = ReverseArray(global_tensor->shape);
-  Array<PrimExpr> global_coords =
-      ReverseArray(global_range.Map([](Range r) { return r->min; }));
+  desc.global_shape = ReverseArray(logical_global_shape);
+  global_coords = ReverseArray(global_coords);
   if (!global_tensor->strides.empty()) {
     desc.global_stride = ReverseArray(global_tensor->strides);
   } else {
