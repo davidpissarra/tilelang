@@ -21,12 +21,25 @@
 Modified from flashinfer
 """
 
+import os
 import pathlib
 
 from tilelang.env import (
     CUTLASS_INCLUDE_DIR,  # noqa: F401
     TILELANG_TEMPLATE_PATH,  # noqa: F401
 )
+
+
+def _get_tilelang_cache_root() -> pathlib.Path:
+    configured_root = os.environ.get("TILELANG_CACHE_DIR")
+    if configured_root:
+        return pathlib.Path(configured_root).expanduser()
+
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return pathlib.Path(xdg_cache_home).expanduser() / "tilelang"
+
+    return pathlib.Path.home() / ".cache" / "tilelang"
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
@@ -44,7 +57,7 @@ def _get_workspace_dir_name() -> pathlib.Path:
     except Exception:
         arch = "noarch"
     # e.g.: $HOME/.cache/tilelang/75_80_89_90/
-    return pathlib.Path.home() / ".cache" / "tilelang" / arch
+    return _get_tilelang_cache_root() / arch
 
 
 TILELANG_JIT_WORKSPACE_DIR = _get_workspace_dir_name()

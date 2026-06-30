@@ -89,7 +89,14 @@ class KernelCache:
             str: SHA256 hash key for the kernel configuration.
         """
         self.execution_backend = execution_backend
-        func_binary = cloudpickle.dumps(func.script(show_meta=True))
+        source_hint = getattr(func, "_cache_source_hint", None)
+        if source_hint is not None:
+            if isinstance(source_hint, bytes):
+                func_binary = source_hint
+            else:
+                func_binary = str(source_hint).encode("utf-8")
+        else:
+            func_binary = cloudpickle.dumps(func.script(show_meta=True))
         key_data = {
             "version": __version__,
             "func": sha256(func_binary).hexdigest(),  # Use SHA256 to generate hash key
