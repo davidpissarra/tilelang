@@ -20,7 +20,6 @@ import functools
 import urllib.request
 from distutils.version import LooseVersion
 import platform
-import multiprocessing
 from setuptools.command.build_ext import build_ext
 import importlib
 import logging
@@ -45,6 +44,44 @@ USE_LLVM = os.environ.get("USE_LLVM", "False").lower() == "true"
 USE_ROCM = os.environ.get("USE_ROCM", "False").lower() == "true"
 # Build with Debug mode
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "False").lower() == "true"
+
+
+def _max_jobs():
+    value = os.environ.get("MAX_JOBS")
+    if not value:
+        return None
+    try:
+        jobs = int(value)
+    except ValueError as error:
+        raise ValueError("MAX_JOBS must be a positive integer") from error
+    if jobs < 1:
+        raise ValueError("MAX_JOBS must be a positive integer")
+    return jobs
+
+
+def _build_env():
+    env = os.environ.copy()
+    jobs = _max_jobs()
+    if jobs is not None:
+        jobs = str(jobs)
+        env["CMAKE_BUILD_PARALLEL_LEVEL"] = jobs
+        env["MAX_JOBS"] = jobs
+        env["MAKEFLAGS"] = f"-j{jobs}"
+    return env
+
+
+def _cmake_parallel_args():
+    jobs = _max_jobs()
+    if jobs is None:
+        return ["--parallel"]
+    return ["--parallel", str(jobs)]
+
+
+def _make_parallel_args():
+    jobs = _max_jobs()
+    if jobs is None:
+        return ["-j"]
+    return [f"-j{jobs}"]
 
 
 def load_module_from_path(module_name, path):
@@ -359,9 +396,9 @@ def build_csrc(llvm_config_path):
             config_file.write("set(USE_ROCM OFF)\n")
     # Run CMake and make
     try:
-        subprocess.check_call(["cmake", ".."])
-        num_jobs = max(1, int(multiprocessing.cpu_count() * 0.75))
-        subprocess.check_call(["make", f"-j{num_jobs}"])
+        env = _build_env()
+        subprocess.check_call(["cmake", ".."], env=env)
+        subprocess.check_call(["make", *_make_parallel_args()], env=env)
     except subprocess.CalledProcessError as error:
         raise RuntimeError("Failed to build TileLang C Source") from error
 
@@ -839,10 +876,12 @@ class TilelangExtensionBuild(build_ext):
                 config_file.write("set(USE_ROCM OFF)\n")
 
         # Run CMake to configure the project with the given arguments.
-        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp)
+        env = _build_env()
+        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp, env=env)
 
-        # Build the project in "Release" mode with all available CPU cores ("-j").
-        subprocess.check_call(["cmake", "--build", ".", "--config", "Release", "-j"],
+        # Build uncapped unless MAX_JOBS supplies an explicit cap.
+        subprocess.check_call(["cmake", "--build", ".", "--config", "Release", *_cmake_parallel_args()],
+                              env=env,
                               cwd=build_temp)
 
 
