@@ -6,6 +6,7 @@
 #include "op/copy.h"
 #include "support/check.h"
 #include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
 
@@ -1733,6 +1734,72 @@ BulkCopyTile ComputeBulkCopyTile(const Array<PrimExpr> &shared_shape,
   };
 }
 
+// Fold a sliced view's `elem_offset` into the TMA descriptor's global coordinates.
+//
+// The descriptor is built from `global_tensor->data`, the base pointer of the whole
+// allocation, and from the buffer's declared shape -- so a Buffer that is a *view* into a
+// larger one addresses the wrong elements, because its `elem_offset` is simply dropped.
+// (The 1D path is unaffected: it goes through `access_ptr`, which includes the offset.)
+//
+// Decomposing the offset against the strides turns it back into per-dimension
+// coordinates, which the descriptor can express, and widening the declared global extents
+// keeps the shifted access window inside the tensor map's bounds. Strides are left alone:
+// the underlying memory layout has not changed, only the region being described.
+//
+// Returns false when the last element some dimension touches cannot be shown to be in
+// range -- an unbounded symbolic coordinate -- in which case the caller must fall back to
+// a normal copy rather than emit a descriptor that could read out of bounds.
+static bool NormalizeGlobalTensorView(const Buffer &buffer,
+                                      const Array<PrimExpr> &strides,
+                                      arith::Analyzer *analyzer,
+                                      Array<PrimExpr> *global_shape,
+                                      Array<Range> *global_range) {
+  ICHECK(global_shape != nullptr);
+  ICHECK(global_range != nullptr);
+  ICHECK_EQ(buffer->shape.size(), global_range->size())
+      << "buffer shape/range rank mismatch";
+
+  if (!buffer->elem_offset.defined() || is_zero(buffer->elem_offset)) {
+    return true;
+  }
+  ICHECK_EQ(strides.size(), buffer->shape.size())
+      << "buffer stride/shape rank mismatch";
+
+  PrimExpr remaining_offset = analyzer->Simplify(buffer->elem_offset);
+  for (size_t i = 0; i < strides.size(); ++i) {
+    PrimExpr coord;
+    if (i + 1 < strides.size()) {
+      coord = analyzer->Simplify(FloorDiv(remaining_offset, strides[i]));
+      remaining_offset =
+          analyzer->Simplify(FloorMod(remaining_offset, strides[i]));
+    } else {
+      // The innermost stride is 1 for any layout TMA accepts, so whatever is left
+      // of the offset is the innermost coordinate.
+      coord = analyzer->Simplify(remaining_offset);
+    }
+
+    const Range &range = (*global_range)[i];
+    PrimExpr normalized_min = analyzer->Simplify(range->min + coord);
+    global_range->Set(i, Range::FromMinExtent(normalized_min, range->extent));
+
+    PrimExpr last_accessed =
+        analyzer->Simplify(normalized_min + range->extent - 1);
+    arith::ConstIntBound bound = analyzer->const_int_bound(last_accessed);
+    if (bound->min_value < 0 ||
+        bound->max_value == arith::ConstIntBound::kPosInf) {
+      return false;
+    }
+
+    int64_t required_extent = bound->max_value + 1;
+    if (const auto *current_extent = as_const_int((*global_shape)[i])) {
+      required_extent = std::max(required_extent, *current_extent);
+    }
+    global_shape->Set(i,
+                      IntImm((*global_shape)[i].dtype(), required_extent));
+  }
+  return true;
+}
+
 } // namespace
 
 Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
@@ -1772,6 +1839,15 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
     global_stride = global_tensor->strides;
   } else {
     global_stride = makeRowMajorStrides(global_shape);
+  }
+
+  // A sliced global buffer view carries its offset in `elem_offset`, which the
+  // descriptor has no field for; fold it into the coordinates instead.
+  if (!NormalizeGlobalTensorView(global_tensor, global_stride, analyzer,
+                                 &global_shape, &global_range)) {
+    DLOG(WARNING) << "TMA bulk copy cannot normalize the sliced view of "
+                  << global_tensor->name << ", fallback to normal copy.";
+    return fallback_to_normal("unnormalizable sliced global buffer view");
   }
 
   // Check if tile shapes match, and compute the tile layouts.
