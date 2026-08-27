@@ -267,7 +267,15 @@ class KernelCache:
             str: SHA256 hash key for the kernel configuration.
         """
         self.execution_backend = execution_backend
-        func_binary = func.script(show_meta=True).encode()
+        # A caller that generated this kernel from source text can hand us that text to
+        # hash, via `_cache_source_hint`. Rendering the PrimFunc back to TVMScript is both
+        # slower and a weaker key: two different sources can round-trip to the same script.
+        source_hint = getattr(func, "_cache_source_hint", None)
+        if source_hint is not None:
+            func_binary = (source_hint if isinstance(source_hint, bytes) else
+                           str(source_hint).encode("utf-8"))
+        else:
+            func_binary = func.script(show_meta=True).encode()
         key_data = {
             "func": sha256(func_binary).hexdigest(),  # Use SHA256 to generate hash key
             "out_idx": (tuple(out_idx) if isinstance(out_idx, (list, tuple)) else [out_idx]),
