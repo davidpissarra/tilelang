@@ -2047,7 +2047,66 @@ private:
             &producer_access,
             LocalAccessCollector::Collect(stmt, buffer_data_to_buffer_));
       }
+      // Expressions that are spliced VERBATIM into both warp-specialised branches must
+      // keep reading the same buffers in both. `BufferRemapper::Rewrite` below rewrites the
+      // producer branch wholesale -- including, via StmtMutator's ForNode visitor, the
+      // pipelined loop's min and extent -- so cloning a buffer that one of these
+      // expressions reads makes the producer and the consumer disagree about how many
+      // iterations to run, or about whether to run the body at all. Their mbarrier
+      // arrive/wait sequences then desynchronise. The loop bounds at least get caught by
+      // the analyser ("Trying to update var 't' with a different maximum value:
+      // rq_producer_ws[0] - 1 vs rq[0] - 1"), because both loops share one loop Var; the
+      // body condition is not checked by anything and simply hangs the kernel, since it
+      // guards the barrier arrivals and the phase counters together.
+      //
+      // Do NOT "fix" that by giving each branch a fresh loop Var: that only silences the
+      // analyser and leaves the numeric divergence, turning a loud compile error into a
+      // silent deadlock.
+      BufferSet shared_expr_buffers;
+      {
+        Array<Stmt> shared_exprs;
+        shared_exprs.push_back(Evaluate(pipeline_loop->extent));
+        shared_exprs.push_back(Evaluate(pipeline_loop->min));
+        if (loop_body_condition.defined()) {
+          shared_exprs.push_back(Evaluate(loop_body_condition.value()));
+        }
+        for (const auto &binding : outer_leading_bindings) {
+          shared_exprs.push_back(Evaluate(binding.second));
+        }
+        for (const auto &binding : inner_leading_bindings) {
+          shared_exprs.push_back(Evaluate(binding.second));
+        }
+        for (const Stmt &stmt : shared_exprs) {
+          LocalAccessSummary summary =
+              LocalAccessCollector::Collect(stmt, buffer_data_to_buffer_);
+          for (const auto &buffer : summary.read_buffers) {
+            shared_expr_buffers.insert(buffer);
+          }
+        }
+      }
+
+      // A buffer the producer only READS also cannot be cloned: the clone is initialised
+      // solely from `extracted_producer_init_`, and the prelude classifier keeps an init in
+      // the SHARED prelude (writing the original) whenever some other pre-loop statement
+      // reads the same buffer without writing a branch-private one -- a prelude TMA
+      // prefetch indexed by that scalar, for instance. The clone is still substituted into
+      // the producer's copy of the expression, with nothing anywhere writing it, so the
+      // producer reads uninitialised local memory.
+      BufferSet producer_written;
+      for (const auto &buffer : producer_access.write_buffers) {
+        producer_written.insert(buffer);
+      }
+
       auto maybe_clone = [&](const Buffer &buffer) {
+        // Restricted to plain "local" buffers on purpose. A real `local.fragment` is
+        // invisible to layout inference only once cloned (CloneBranchPrivateBuffer
+        // downgrades the scope), so refusing to clone one would reintroduce exactly the
+        // two-thread-ranges-one-layout problem the cloning exists to solve. A scalar the
+        // bounds read is plain "local", which layout inference ignores either way.
+        if (!IsFragmentBuffer(buffer) &&
+            (shared_expr_buffers.count(buffer) || !producer_written.count(buffer))) {
+          return;
+        }
         if (!buffer.defined() ||
             !(IsFragmentBuffer(buffer) || IsLocalBuffer(buffer)) ||
             !block_alloc_buffers.count(buffer) ||

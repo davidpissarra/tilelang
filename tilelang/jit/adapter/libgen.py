@@ -66,7 +66,7 @@ class LibraryGenerator:
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cu", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".cu", _lib_ext)
 
-            enable_fast_math = self.pass_configs.get(PassConfigKey.TL_ENABLE_FAST_MATH, False)
+            enable_fast_math = self.pass_configs.get(PassConfigKey.TL_ENABLE_FAST_MATH, True)
 
             ptxas_usage_level = self.pass_configs.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL, None)
             if ptxas_usage_level is not None:

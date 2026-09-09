@@ -69,7 +69,7 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     compile_format = "fatbin" if len(target_code_list) > 1 else "cubin"
 
     cfg = pass_config or {}
-    enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, False))
+    enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, True))
     ptxas_usage_level = cfg.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL, None)
     if ptxas_usage_level is not None:
         ptxas_usage_level = int(ptxas_usage_level)
